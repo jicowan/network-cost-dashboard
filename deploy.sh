@@ -22,8 +22,9 @@ REGION="${AWS_REGION:-}"
 MONITOR_NAME="${MONITOR_NAME:-eks-network-costs}"
 S3_BUCKET="${S3_BUCKET:-}"
 S3_PREFIX="${S3_PREFIX:-network-cost-data}"
-RATES_PARAMETER="${RATES_PARAMETER:-/network-costs/rates-per-gb}"
 ATHENA_DATABASE="${ATHENA_DATABASE:-network_costs}"
+HAS_S3_ENDPOINT="${HAS_S3_ENDPOINT:-false}"
+HAS_DYNAMODB_ENDPOINT="${HAS_DYNAMODB_ENDPOINT:-false}"
 FUNCTION_NAME="eks-network-cost-exporter"
 ROLE_NAME="eks-network-cost-lambda-role"
 SCHEDULE_NAME="eks-network-cost-hourly"
@@ -43,8 +44,9 @@ while [[ $# -gt 0 ]]; do
         --monitor-name)     MONITOR_NAME="$2";  shift 2 ;;
         --s3-bucket)        S3_BUCKET="$2";     shift 2 ;;
         --s3-prefix)        S3_PREFIX="$2";     shift 2 ;;
-        --rates-parameter)  RATES_PARAMETER="$2"; shift 2 ;;
         --athena-database)  ATHENA_DATABASE="$2"; shift 2 ;;
+        --has-s3-endpoint)  HAS_S3_ENDPOINT="$2"; shift 2 ;;
+        --has-dynamodb-endpoint) HAS_DYNAMODB_ENDPOINT="$2"; shift 2 ;;
         --function-name)    FUNCTION_NAME="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
@@ -97,32 +99,7 @@ aws s3api put-bucket-lifecycle-configuration \
     }'
 
 # -------------------------------------------------------------------
-# 2. Create SSM parameter (if it doesn't exist)
-# -------------------------------------------------------------------
-echo ""
-echo "==> Checking SSM parameter ${RATES_PARAMETER}..."
-
-if aws ssm get-parameter --name "$RATES_PARAMETER" --region "$REGION" >/dev/null 2>&1; then
-    echo "    Parameter already exists (will not overwrite)."
-else
-    echo "    Creating parameter with default rates..."
-    aws ssm put-parameter \
-        --name "$RATES_PARAMETER" \
-        --region "$REGION" \
-        --type String \
-        --value '{
-            "INTRA_AZ": 0.00,
-            "INTER_AZ": 0.02,
-            "INTER_VPC": 0.02,
-            "INTER_REGION": 0.02,
-            "AMAZON_S3": 0.00,
-            "AMAZON_DYNAMODB": 0.00,
-            "UNCLASSIFIED": 0.09
-        }'
-fi
-
-# -------------------------------------------------------------------
-# 3. Create IAM role for the Lambda function
+# 2. Create IAM role for the Lambda function
 # -------------------------------------------------------------------
 echo ""
 echo "==> Checking IAM role ${ROLE_NAME}..."
@@ -165,12 +142,6 @@ LAMBDA_POLICY=$(cat <<EOF
             "Effect": "Allow",
             "Action": ["s3:PutObject"],
             "Resource": "arn:aws:s3:::${S3_BUCKET}/${S3_PREFIX}/*"
-        },
-        {
-            "Sid": "SSMReadRates",
-            "Effect": "Allow",
-            "Action": ["ssm:GetParameter"],
-            "Resource": "arn:aws:ssm:${REGION}:${ACCOUNT_ID}:parameter${RATES_PARAMETER}"
         },
         {
             "Sid": "CloudWatchLogs",
@@ -217,6 +188,12 @@ LAMBDA_POLICY=$(cat <<EOF
             "Effect": "Allow",
             "Action": ["s3:GetBucketLocation", "s3:ListBucket"],
             "Resource": "arn:aws:s3:::${S3_BUCKET}"
+        },
+        {
+            "Sid": "PricingAPIRead",
+            "Effect": "Allow",
+            "Action": ["pricing:GetProducts", "pricing:GetAttributeValues"],
+            "Resource": "*"
         }
     ]
 }
@@ -232,7 +209,7 @@ aws iam put-role-policy \
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
 # -------------------------------------------------------------------
-# 4. Package the Lambda
+# 3. Package the Lambda
 # -------------------------------------------------------------------
 echo ""
 echo "==> Packaging Lambda..."
@@ -244,7 +221,7 @@ rm -f "$ZIPFILE"
 echo "    Created ${ZIPFILE}"
 
 # -------------------------------------------------------------------
-# 5. Create or update the Lambda function
+# 4. Create or update the Lambda function
 # -------------------------------------------------------------------
 echo ""
 echo "==> Deploying Lambda function ${FUNCTION_NAME}..."
@@ -256,9 +233,10 @@ ENV_VARS=$(cat <<EOF
         "S3_BUCKET": "${S3_BUCKET}",
         "S3_PREFIX": "${S3_PREFIX}",
         "QUERY_LIMIT": "500",
-        "RATES_PARAMETER": "${RATES_PARAMETER}",
         "ATHENA_DATABASE": "${ATHENA_DATABASE}",
-        "ATHENA_OUTPUT": "s3://${S3_BUCKET}/athena-results/"
+        "ATHENA_OUTPUT": "s3://${S3_BUCKET}/athena-results/",
+        "HAS_S3_ENDPOINT": "${HAS_S3_ENDPOINT}",
+        "HAS_DYNAMODB_ENDPOINT": "${HAS_DYNAMODB_ENDPOINT}"
     }
 }
 EOF
@@ -318,7 +296,7 @@ FUNCTION_ARN=$(aws lambda get-function \
 echo "    Function ARN: ${FUNCTION_ARN}"
 
 # -------------------------------------------------------------------
-# 6. Create IAM role for EventBridge Scheduler
+# 5. Create IAM role for EventBridge Scheduler
 # -------------------------------------------------------------------
 echo ""
 echo "==> Checking scheduler role ${SCHEDULE_ROLE_NAME}..."
@@ -362,7 +340,7 @@ aws iam put-role-policy \
 SCHEDULE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULE_ROLE_NAME}"
 
 # -------------------------------------------------------------------
-# 7. Create or update the EventBridge schedule
+# 6. Create or update the EventBridge schedule
 # -------------------------------------------------------------------
 echo ""
 echo "==> Checking EventBridge schedule ${SCHEDULE_NAME}..."
@@ -408,8 +386,13 @@ echo ""
 echo "  Lambda function:  ${FUNCTION_NAME}"
 echo "  Schedule:         ${SCHEDULE_NAME} (hourly)"
 echo "  S3 output:        s3://${S3_BUCKET}/${S3_PREFIX}/"
-echo "  Rates parameter:  ${RATES_PARAMETER}"
 echo "  Monitor:          ${MONITOR_NAME}"
+echo "  S3 Gateway Endpoint:       ${HAS_S3_ENDPOINT}"
+echo "  DynamoDB Gateway Endpoint: ${HAS_DYNAMODB_ENDPOINT}"
+echo ""
+echo "  Pricing is fetched dynamically from AWS Pricing API."
+echo "  If no gateway endpoints exist, S3/DynamoDB traffic is"
+echo "  charged at the NAT Gateway processing rate (\$0.045/GB)."
 echo ""
 echo "  To test manually:"
 echo "    aws lambda invoke \\"

@@ -269,11 +269,21 @@ with tab_flows:
     with col_limit:
         limit = st.slider("Number of flows", min_value=10, max_value=100, value=25)
 
-    pod_only = st.checkbox(
-        "Show pod-to-pod flows only",
-        value=True,
-        help="Exclude node-level traffic (kubelet, kube-proxy, etc.)",
-    )
+    col_pod_only, col_aggregate = st.columns(2)
+
+    with col_pod_only:
+        pod_only = st.checkbox(
+            "Show pod-to-pod flows only",
+            value=True,
+            help="Exclude node-level traffic (kubelet, kube-proxy, etc.)",
+        )
+
+    with col_aggregate:
+        aggregate_by_service = st.checkbox(
+            "Aggregate by service",
+            value=True,
+            help="Group by service name instead of individual pod IPs",
+        )
 
     # Build WHERE clause
     where_clauses = [
@@ -285,24 +295,45 @@ with tab_flows:
 
     where_sql = " AND ".join(where_clauses)
 
-    df_flows = run_query(f"""
-        SELECT
-            local_pod_namespace,
-            local_service_name,
-            local_az,
-            remote_pod_namespace,
-            remote_service_name,
-            remote_az,
-            remote_ip,
-            target_port,
-            SUM(gb) AS total_gb,
-            SUM(estimated_cost_usd) AS cost
-        FROM network_cost_details
-        WHERE {where_sql}
-        GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
-        ORDER BY cost DESC
-        LIMIT {limit}
-    """)
+    if aggregate_by_service:
+        # Aggregate by service (no remote_ip)
+        df_flows = run_query(f"""
+            SELECT
+                local_pod_namespace,
+                local_service_name,
+                local_az,
+                remote_pod_namespace,
+                remote_service_name,
+                remote_az,
+                target_port,
+                SUM(gb) AS total_gb,
+                SUM(estimated_cost_usd) AS cost
+            FROM network_cost_details
+            WHERE {where_sql}
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            ORDER BY cost DESC
+            LIMIT {limit}
+        """)
+    else:
+        # Show individual pod IPs
+        df_flows = run_query(f"""
+            SELECT
+                local_pod_namespace,
+                local_service_name,
+                local_az,
+                remote_pod_namespace,
+                remote_service_name,
+                remote_az,
+                remote_ip,
+                target_port,
+                SUM(gb) AS total_gb,
+                SUM(estimated_cost_usd) AS cost
+            FROM network_cost_details
+            WHERE {where_sql}
+            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+            ORDER BY cost DESC
+            LIMIT {limit}
+        """)
 
     if not df_flows.empty:
         df_flows["total_gb"] = pd.to_numeric(df_flows["total_gb"])

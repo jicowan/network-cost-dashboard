@@ -9,8 +9,8 @@ This solution periodically exports network flow data from CloudWatch Network Flo
 ### Architecture
 
 ```
-                      SSM Parameter Store
-                       (rates-per-gb)
+                      AWS Pricing API
+                       (dynamic rates)
                             │
 EventBridge (hourly) ──→ Lambda ──→ Network Flow Monitor API
                             │           (top 500 per category)
@@ -182,25 +182,47 @@ Open http://localhost:8501 in your browser.
 
 ## Configuration
 
-### Adjusting Cost Rates
+### Dynamic Pricing
 
-Rates are stored in SSM Parameter Store and can be updated without redeploying:
+Rates are fetched automatically from the AWS Pricing API at runtime, so they always reflect current AWS pricing for your region. The Lambda caches pricing data for 1 hour to minimize API calls.
+
+**Pricing sources:**
+| Category | Source | Notes |
+|----------|--------|-------|
+| `INTER_AZ` | Pricing API (`IntraRegion`) | $0.01/GB × 2 directions |
+| `INTER_VPC` | Pricing API (`IntraRegion`) | Same as inter-AZ when cross-AZ |
+| `INTER_REGION` | Pricing API (`InterRegion Outbound`) | Varies by region pair |
+| `AMAZON_S3` | NAT Gateway rate or $0 | Depends on gateway endpoint |
+| `AMAZON_DYNAMODB` | NAT Gateway rate or $0 | Depends on gateway endpoint |
+| `UNCLASSIFIED` | Pricing API (`AWS Outbound`) | Tiered pricing by volume |
+
+### VPC Gateway Endpoints
+
+If you have VPC Gateway Endpoints for S3 and/or DynamoDB, traffic to those services is free. Configure this during deployment:
 
 ```bash
-aws ssm put-parameter \
-  --name /network-costs/rates-per-gb \
-  --type String \
-  --overwrite \
-  --value '{
-    "INTRA_AZ": 0.00,
-    "INTER_AZ": 0.02,
-    "INTER_VPC": 0.02,
-    "INTER_REGION": 0.02,
-    "AMAZON_S3": 0.00,
-    "AMAZON_DYNAMODB": 0.00,
-    "UNCLASSIFIED": 0.09
-  }'
+./deploy.sh \
+  --region us-west-2 \
+  --monitor-name eks-network-costs \
+  --s3-bucket <BUCKET_NAME> \
+  --has-s3-endpoint true \
+  --has-dynamodb-endpoint true
 ```
+
+Without gateway endpoints, traffic to S3/DynamoDB goes through NAT Gateway and incurs the NAT Gateway data processing charge (~$0.045/GB).
+
+### Internet Egress Tiered Pricing
+
+Internet egress (UNCLASSIFIED category) uses AWS tiered pricing based on total monthly volume:
+
+| Volume | Price per GB |
+|--------|--------------|
+| First 10 TB | $0.09 |
+| Next 40 TB | $0.085 |
+| Next 100 TB | $0.07 |
+| Over 150 TB | $0.05 |
+
+The Lambda calculates costs using tiered pricing based on the actual volume in each period
 
 ### Backfilling Historical Data
 
