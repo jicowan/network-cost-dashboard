@@ -269,7 +269,7 @@ with tab_flows:
     with col_limit:
         limit = st.slider("Number of flows", min_value=10, max_value=100, value=25)
 
-    col_pod_only, col_aggregate = st.columns(2)
+    col_pod_only, col_group_by = st.columns(2)
 
     with col_pod_only:
         pod_only = st.checkbox(
@@ -278,11 +278,12 @@ with tab_flows:
             help="Exclude node-level traffic (kubelet, kube-proxy, etc.)",
         )
 
-    with col_aggregate:
-        aggregate_by_service = st.checkbox(
-            "Aggregate by service",
-            value=True,
-            help="Group by service name instead of individual pod IPs",
+    with col_group_by:
+        group_by = st.selectbox(
+            "Group by",
+            options=["Service", "Deployment", "ReplicaSet", "Pod IP"],
+            index=0,
+            help="Choose how to aggregate flow data",
         )
 
     # Build WHERE clause
@@ -295,8 +296,7 @@ with tab_flows:
 
     where_sql = " AND ".join(where_clauses)
 
-    if aggregate_by_service:
-        # Aggregate by service (no remote_ip)
+    if group_by == "Service":
         df_flows = run_query(f"""
             SELECT
                 local_pod_namespace,
@@ -314,15 +314,51 @@ with tab_flows:
             ORDER BY cost DESC
             LIMIT {limit}
         """)
-    else:
-        # Show individual pod IPs
+    elif group_by == "Deployment":
         df_flows = run_query(f"""
             SELECT
                 local_pod_namespace,
-                local_service_name,
+                regexp_extract(local_pod_name, '^(.*)-[a-z0-9]+-[a-z0-9]+$', 1) AS local_deployment,
                 local_az,
                 remote_pod_namespace,
-                remote_service_name,
+                regexp_extract(remote_pod_name, '^(.*)-[a-z0-9]+-[a-z0-9]+$', 1) AS remote_deployment,
+                remote_az,
+                target_port,
+                SUM(gb) AS total_gb,
+                SUM(estimated_cost_usd) AS cost
+            FROM network_cost_details
+            WHERE {where_sql}
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            ORDER BY cost DESC
+            LIMIT {limit}
+        """)
+    elif group_by == "ReplicaSet":
+        df_flows = run_query(f"""
+            SELECT
+                local_pod_namespace,
+                regexp_extract(local_pod_name, '^(.*)-[a-z0-9]+$', 1) AS local_replicaset,
+                local_az,
+                remote_pod_namespace,
+                regexp_extract(remote_pod_name, '^(.*)-[a-z0-9]+$', 1) AS remote_replicaset,
+                remote_az,
+                target_port,
+                SUM(gb) AS total_gb,
+                SUM(estimated_cost_usd) AS cost
+            FROM network_cost_details
+            WHERE {where_sql}
+            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            ORDER BY cost DESC
+            LIMIT {limit}
+        """)
+    else:
+        # Pod IP - show individual pod IPs
+        df_flows = run_query(f"""
+            SELECT
+                local_pod_namespace,
+                local_pod_name,
+                local_az,
+                remote_pod_namespace,
+                remote_pod_name,
                 remote_az,
                 remote_ip,
                 target_port,
