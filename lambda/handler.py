@@ -12,9 +12,12 @@ import time
 import logging
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+from io import BytesIO
 from typing import Optional
 
 import boto3
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -102,6 +105,47 @@ _pricing_cache = {
     "timestamp": None,
 }
 PRICING_CACHE_TTL_SECONDS = 3600  # Refresh pricing every hour
+
+# PyArrow schemas for Parquet output
+DETAILS_SCHEMA = pa.schema([
+    ('period_start', pa.string()),
+    ('destination_category', pa.string()),
+    ('local_ip', pa.string()),
+    ('local_az', pa.string()),
+    ('local_vpc_id', pa.string()),
+    ('local_subnet_id', pa.string()),
+    ('local_instance_id', pa.string()),
+    ('local_region', pa.string()),
+    ('remote_ip', pa.string()),
+    ('remote_az', pa.string()),
+    ('remote_vpc_id', pa.string()),
+    ('remote_subnet_id', pa.string()),
+    ('remote_instance_id', pa.string()),
+    ('remote_region', pa.string()),
+    ('local_pod_name', pa.string()),
+    ('local_pod_namespace', pa.string()),
+    ('local_service_name', pa.string()),
+    ('remote_pod_name', pa.string()),
+    ('remote_pod_namespace', pa.string()),
+    ('remote_service_name', pa.string()),
+    ('snat_ip', pa.string()),
+    ('dnat_ip', pa.string()),
+    ('target_port', pa.int32()),
+    ('traversed_constructs', pa.string()),
+    ('bytes', pa.int64()),
+    ('gb', pa.float64()),
+    ('rate_per_gb', pa.float64()),
+    ('estimated_cost_usd', pa.float64()),
+])
+
+SUMMARY_SCHEMA = pa.schema([
+    ('period_start', pa.string()),
+    ('namespace', pa.string()),
+    ('destination_category', pa.string()),
+    ('total_bytes', pa.int64()),
+    ('total_gb', pa.float64()),
+    ('estimated_cost_usd', pa.float64()),
+])
 
 
 def get_data_transfer_price(
@@ -393,16 +437,16 @@ def handler(event, context):
 
     detail_key = (
         f"{S3_PREFIX}/details/"
-        f"date={date_partition}/hour={hour_partition}/data.json"
+        f"date={date_partition}/hour={hour_partition}/data.parquet"
     )
-    write_ndjson_to_s3(all_contributors, detail_key)
+    write_parquet_to_s3(all_contributors, detail_key, DETAILS_SCHEMA)
 
     # Write namespace summary to S3
     summary_key = (
         f"{S3_PREFIX}/summary/"
-        f"date={date_partition}/hour={hour_partition}/summary.json"
+        f"date={date_partition}/hour={hour_partition}/summary.parquet"
     )
-    write_ndjson_to_s3(summary, summary_key)
+    write_parquet_to_s3(summary, summary_key, SUMMARY_SCHEMA)
 
     # Register partitions in Athena
     add_partition("details", date_partition, hour_partition)
@@ -563,14 +607,31 @@ def build_namespace_summary(contributors):
     return summary
 
 
-def write_ndjson_to_s3(records, key):
-    """Write records as newline-delimited JSON to S3."""
-    body = "\n".join(json.dumps(r) for r in records)
+def write_parquet_to_s3(records: list[dict], key: str, schema: pa.Schema):
+    """Write records as Parquet to S3."""
+    if not records:
+        logger.warning("No records to write for %s", key)
+        return
+
+    # Convert to PyArrow Table with explicit schema
+    table = pa.Table.from_pylist(records, schema=schema)
+
+    # Write to buffer with Snappy compression
+    buffer = BytesIO()
+    pq.write_table(
+        table,
+        buffer,
+        compression='snappy',
+        use_dictionary=True,
+    )
+
+    # Upload to S3
+    buffer.seek(0)
     s3.put_object(
         Bucket=S3_BUCKET,
         Key=key,
-        Body=body.encode("utf-8"),
-        ContentType="application/x-ndjson",
+        Body=buffer.getvalue(),
+        ContentType="application/x-parquet",
     )
     logger.info("Wrote %d records to s3://%s/%s", len(records), S3_BUCKET, key)
 

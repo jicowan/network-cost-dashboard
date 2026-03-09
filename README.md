@@ -16,7 +16,7 @@ EventBridge (hourly) ──→ Lambda ──→ Network Flow Monitor API
                             │           (top 500 per category)
                             │
                             ▼
-                     S3 (NDJSON, partitioned)
+                     S3 (Parquet, Snappy compressed)
                        ├── details/date=YYYY-MM-DD/hour=HH/
                        └── summary/date=YYYY-MM-DD/hour=HH/
                             │
@@ -148,8 +148,9 @@ CREATE EXTERNAL TABLE network_costs.network_cost_details (
   estimated_cost_usd    DOUBLE
 )
 PARTITIONED BY (date STRING, hour STRING)
-ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://<BUCKET_NAME>/network-cost-data/details/';
+STORED AS PARQUET
+LOCATION 's3://<BUCKET_NAME>/network-cost-data/details/'
+TBLPROPERTIES ('parquet.compression'='SNAPPY');
 
 CREATE EXTERNAL TABLE network_costs.network_cost_summary (
   period_start          STRING,
@@ -160,8 +161,9 @@ CREATE EXTERNAL TABLE network_costs.network_cost_summary (
   estimated_cost_usd    DOUBLE
 )
 PARTITIONED BY (date STRING, hour STRING)
-ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://<BUCKET_NAME>/network-cost-data/summary/';
+STORED AS PARQUET
+LOCATION 's3://<BUCKET_NAME>/network-cost-data/summary/'
+TBLPROPERTIES ('parquet.compression'='SNAPPY');
 ```
 
 Load existing partitions (only needed once; new partitions are added automatically):

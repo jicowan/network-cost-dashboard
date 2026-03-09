@@ -1,5 +1,6 @@
-# Plan file (contains account-specific values)
+# Plan and PRD files (contains account-specific values)
 PLAN.md
+PRD-*.md
 
 # Python
 __pycache__/

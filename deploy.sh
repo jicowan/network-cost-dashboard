@@ -31,7 +31,8 @@ SCHEDULE_NAME="eks-network-cost-hourly"
 SCHEDULE_ROLE_NAME="eks-network-cost-scheduler-role"
 RUNTIME="python3.12"
 TIMEOUT=300
-MEMORY=256
+MEMORY=512  # Increased for PyArrow
+PYARROW_LAYER_NAME="pyarrow-layer"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -209,7 +210,51 @@ aws iam put-role-policy \
 ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
 
 # -------------------------------------------------------------------
-# 3. Package the Lambda
+# 3. Create or get PyArrow Lambda Layer
+# -------------------------------------------------------------------
+echo ""
+echo "==> Checking PyArrow Lambda layer..."
+
+LAYER_ARN=$(aws lambda list-layer-versions \
+    --layer-name "$PYARROW_LAYER_NAME" \
+    --region "$REGION" \
+    --query 'LayerVersions[0].LayerVersionArn' \
+    --output text 2>/dev/null)
+
+if [[ "$LAYER_ARN" == "None" || -z "$LAYER_ARN" ]]; then
+    echo "    Creating PyArrow layer using Docker (this may take a minute)..."
+
+    LAYER_DIR="/tmp/pyarrow-layer-$$"
+    LAYER_ZIP="/tmp/pyarrow-layer-$$.zip"
+    rm -rf "$LAYER_DIR" "$LAYER_ZIP"
+    mkdir -p "$LAYER_DIR"
+
+    # Build layer using Lambda Python 3.12 Docker image for compatibility
+    # Use --platform to ensure x86_64 even on Apple Silicon Macs
+    docker run --rm --platform linux/amd64 --entrypoint pip -v "$LAYER_DIR:/layer" public.ecr.aws/lambda/python:3.12 \
+        install pyarrow -t /layer/python --quiet
+
+    # Create layer zip
+    (cd "$LAYER_DIR" && zip -r -q "$LAYER_ZIP" python)
+
+    # Publish layer
+    LAYER_ARN=$(aws lambda publish-layer-version \
+        --layer-name "$PYARROW_LAYER_NAME" \
+        --region "$REGION" \
+        --zip-file "fileb://${LAYER_ZIP}" \
+        --compatible-runtimes python3.12 \
+        --compatible-architectures x86_64 \
+        --query 'LayerVersionArn' \
+        --output text)
+
+    rm -rf "$LAYER_DIR" "$LAYER_ZIP"
+    echo "    Created layer: ${LAYER_ARN}"
+else
+    echo "    Layer already exists: ${LAYER_ARN}"
+fi
+
+# -------------------------------------------------------------------
+# 4. Package the Lambda
 # -------------------------------------------------------------------
 echo ""
 echo "==> Packaging Lambda..."
@@ -221,7 +266,7 @@ rm -f "$ZIPFILE"
 echo "    Created ${ZIPFILE}"
 
 # -------------------------------------------------------------------
-# 4. Create or update the Lambda function
+# 5. Create or update the Lambda function
 # -------------------------------------------------------------------
 echo ""
 echo "==> Deploying Lambda function ${FUNCTION_NAME}..."
@@ -265,6 +310,7 @@ if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$REGION" >
         --role "$ROLE_ARN" \
         --timeout "$TIMEOUT" \
         --memory-size "$MEMORY" \
+        --layers "$LAYER_ARN" \
         --environment "$ENV_VARS"
 else
     echo "    Creating function..."
@@ -274,6 +320,7 @@ else
 
     aws lambda create-function \
         --function-name "$FUNCTION_NAME" \
+        --layers "$LAYER_ARN" \
         --region "$REGION" \
         --runtime "$RUNTIME" \
         --handler handler.handler \
@@ -296,7 +343,7 @@ FUNCTION_ARN=$(aws lambda get-function \
 echo "    Function ARN: ${FUNCTION_ARN}"
 
 # -------------------------------------------------------------------
-# 5. Create IAM role for EventBridge Scheduler
+# 6. Create IAM role for EventBridge Scheduler
 # -------------------------------------------------------------------
 echo ""
 echo "==> Checking scheduler role ${SCHEDULE_ROLE_NAME}..."
@@ -340,7 +387,7 @@ aws iam put-role-policy \
 SCHEDULE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${SCHEDULE_ROLE_NAME}"
 
 # -------------------------------------------------------------------
-# 6. Create or update the EventBridge schedule
+# 7. Create or update the EventBridge schedule
 # -------------------------------------------------------------------
 echo ""
 echo "==> Checking EventBridge schedule ${SCHEDULE_NAME}..."
