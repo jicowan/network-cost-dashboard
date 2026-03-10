@@ -106,6 +106,9 @@ _pricing_cache = {
 }
 PRICING_CACHE_TTL_SECONDS = 3600  # Refresh pricing every hour
 
+# S3 key for monthly cumulative egress tracking
+CUMULATIVE_PREFIX = "cumulative"
+
 # PyArrow schemas for Parquet output
 DETAILS_SCHEMA = pa.schema([
     ('period_start', pa.string()),
@@ -338,35 +341,123 @@ def load_rates() -> tuple[dict, list]:
         return DEFAULT_RATES_PER_GB, DEFAULT_EGRESS_TIERS
 
 
-def calculate_tiered_cost(total_bytes: int, tiers: list) -> float:
+def get_cumulative_key(year: int, month: int) -> str:
+    """Get S3 key for monthly cumulative egress tracking."""
+    return f"{S3_PREFIX}/{CUMULATIVE_PREFIX}/{year:04d}-{month:02d}.json"
+
+
+def read_cumulative_egress(year: int, month: int) -> int:
     """
-    Calculate cost using tiered pricing based on total volume.
+    Read the cumulative internet egress bytes for a given month.
 
     Args:
-        total_bytes: Total bytes transferred
-        tiers: List of tier dicts with begin_gb, end_gb, price_per_gb
+        year: The year (e.g., 2024)
+        month: The month (1-12)
 
     Returns:
-        Total cost in USD
+        Cumulative bytes transferred so far this month (0 if no data)
     """
-    total_gb = total_bytes / (1024**3)
+    key = get_cumulative_key(year, month)
+    try:
+        resp = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        data = json.loads(resp["Body"].read().decode("utf-8"))
+        cumulative_bytes = data.get("cumulative_bytes", 0)
+        logger.info(
+            "Read cumulative egress for %04d-%02d: %d bytes (%.2f GB)",
+            year, month, cumulative_bytes, cumulative_bytes / (1024**3)
+        )
+        return cumulative_bytes
+    except s3.exceptions.NoSuchKey:
+        logger.info("No cumulative data for %04d-%02d, starting fresh", year, month)
+        return 0
+    except Exception:
+        logger.exception("Failed to read cumulative egress, assuming 0")
+        return 0
+
+
+def write_cumulative_egress(year: int, month: int, cumulative_bytes: int, last_updated: str):
+    """
+    Write the cumulative internet egress bytes for a given month.
+
+    Args:
+        year: The year (e.g., 2024)
+        month: The month (1-12)
+        cumulative_bytes: Total bytes transferred this month
+        last_updated: ISO timestamp of last update
+    """
+    key = get_cumulative_key(year, month)
+    data = {
+        "year": year,
+        "month": month,
+        "cumulative_bytes": cumulative_bytes,
+        "cumulative_gb": round(cumulative_bytes / (1024**3), 4),
+        "last_updated": last_updated,
+    }
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=json.dumps(data, indent=2),
+            ContentType="application/json",
+        )
+        logger.info(
+            "Updated cumulative egress for %04d-%02d: %d bytes (%.2f GB)",
+            year, month, cumulative_bytes, cumulative_bytes / (1024**3)
+        )
+    except Exception:
+        logger.exception("Failed to write cumulative egress")
+
+
+def calculate_tiered_cost(
+    new_bytes: int,
+    tiers: list,
+    cumulative_bytes_before: int = 0,
+) -> float:
+    """
+    Calculate cost using tiered pricing based on monthly cumulative volume.
+
+    The cost is calculated for only the new_bytes, but the tier placement
+    is determined by where cumulative_bytes_before falls in the tiers.
+
+    Args:
+        new_bytes: New bytes transferred in this period
+        tiers: List of tier dicts with begin_gb, end_gb, price_per_gb
+        cumulative_bytes_before: Bytes already transferred this month (before this period)
+
+    Returns:
+        Cost in USD for the new_bytes only
+    """
+    cumulative_gb_before = cumulative_bytes_before / (1024**3)
+    new_gb = new_bytes / (1024**3)
+    cumulative_gb_after = cumulative_gb_before + new_gb
+
     total_cost = 0.0
-    remaining_gb = total_gb
 
     for tier in tiers:
-        if remaining_gb <= 0:
-            break
-
         tier_start = tier["begin_gb"]
         tier_end = tier["end_gb"]
-        tier_size = tier_end - tier_start
+        tier_rate = tier["price_per_gb"]
 
-        if total_gb > tier_start:
-            # How much of this tier do we use?
-            gb_in_tier = min(remaining_gb, tier_size)
-            tier_cost = gb_in_tier * tier["price_per_gb"]
+        # Skip tiers we've already passed completely
+        if cumulative_gb_before >= tier_end:
+            continue
+
+        # Stop if we haven't reached this tier yet
+        if cumulative_gb_after <= tier_start:
+            break
+
+        # Calculate the portion of new transfer that falls in this tier
+        effective_start = max(cumulative_gb_before, tier_start)
+        effective_end = min(cumulative_gb_after, tier_end)
+        gb_in_tier = effective_end - effective_start
+
+        if gb_in_tier > 0:
+            tier_cost = gb_in_tier * tier_rate
             total_cost += tier_cost
-            remaining_gb -= gb_in_tier
+            logger.debug(
+                "Tier %.0f-%.0f GB @ $%.3f/GB: %.4f GB = $%.4f",
+                tier_start, tier_end, tier_rate, gb_in_tier, tier_cost
+            )
 
     return total_cost
 
@@ -411,18 +502,43 @@ def handler(event, context):
             sum(c["bytes"] for c in contributors) / (1024**3),
         )
 
-    # Recalculate UNCLASSIFIED costs using tiered pricing based on total volume
+    # Recalculate UNCLASSIFIED costs using tiered pricing based on monthly cumulative volume
     unclassified_bytes = sum(
         c["bytes"] for c in all_contributors if c["destination_category"] == "UNCLASSIFIED"
     )
     if unclassified_bytes > 0:
-        total_tiered_cost = calculate_tiered_cost(unclassified_bytes, egress_tiers)
+        # Read cumulative egress for this month (before this period)
+        cumulative_before = read_cumulative_egress(start_time.year, start_time.month)
+
+        # Calculate cost for new bytes based on current tier position
+        total_tiered_cost = calculate_tiered_cost(
+            unclassified_bytes, egress_tiers, cumulative_before
+        )
+
+        # Update cumulative egress for the month
+        cumulative_after = cumulative_before + unclassified_bytes
+        write_cumulative_egress(
+            start_time.year,
+            start_time.month,
+            cumulative_after,
+            end_time.isoformat(),
+        )
+
         # Distribute cost proportionally across contributors
         for c in all_contributors:
             if c["destination_category"] == "UNCLASSIFIED":
                 proportion = c["bytes"] / unclassified_bytes
                 c["estimated_cost_usd"] = round(total_tiered_cost * proportion, 6)
-                c["rate_per_gb"] = round(total_tiered_cost / (unclassified_bytes / (1024**3)), 6)
+                # Calculate effective rate for this period
+                effective_rate = total_tiered_cost / (unclassified_bytes / (1024**3)) if unclassified_bytes > 0 else 0
+                c["rate_per_gb"] = round(effective_rate, 6)
+
+        logger.info(
+            "UNCLASSIFIED egress: %.2f GB this period, %.2f GB cumulative this month, $%.4f cost",
+            unclassified_bytes / (1024**3),
+            cumulative_after / (1024**3),
+            total_tiered_cost,
+        )
 
     if not all_contributors:
         logger.info("No data returned for this period")

@@ -127,7 +127,7 @@ def test_fetch_dynamic_rates():
 
 def test_tiered_cost_calculation():
     """Test the tiered cost calculation function."""
-    print("\n=== Testing Tiered Cost Calculation ===")
+    print("\n=== Testing Tiered Cost Calculation (Fresh Start) ===")
 
     test_cases = [
         (1 * (1024**3), "1 GB"),           # 1 GB
@@ -138,12 +138,95 @@ def test_tiered_cost_calculation():
     ]
 
     for bytes_val, label in test_cases:
-        cost = calculate_tiered_cost(bytes_val, DEFAULT_EGRESS_TIERS)
+        cost = calculate_tiered_cost(bytes_val, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=0)
         gb = bytes_val / (1024**3)
         effective_rate = cost / gb if gb > 0 else 0
         print(f"  {label:>10}: ${cost:>12,.2f} (effective rate: ${effective_rate:.4f}/GB)")
 
     return True
+
+
+def test_cumulative_tiered_pricing():
+    """Test tiered cost calculation with cumulative monthly usage."""
+    print("\n=== Testing Cumulative Tiered Pricing ===")
+
+    # Tier boundaries from DEFAULT_EGRESS_TIERS:
+    # Tier 1: 0-10,240 GB @ $0.09/GB
+    # Tier 2: 10,240-51,200 GB @ $0.085/GB
+    # Tier 3: 51,200-153,600 GB @ $0.07/GB
+    # Tier 4: 153,600+ GB @ $0.05/GB
+
+    GB = 1024**3
+    all_passed = True
+
+    # Test 1: Fresh start - 100 GB should be all at $0.09/GB
+    print("\n  Test 1: Fresh start (0 cumulative), transfer 100 GB")
+    cost = calculate_tiered_cost(100 * GB, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=0)
+    expected = 100 * 0.09  # $9.00
+    passed = abs(cost - expected) < 0.01
+    print(f"    Expected: ${expected:.2f}, Got: ${cost:.2f} {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    # Test 2: Already at 10,000 GB, transfer 500 GB (crosses into tier 2)
+    print("\n  Test 2: 10,000 GB cumulative, transfer 500 GB (crosses tier 1->2)")
+    cumulative_before = 10000 * GB
+    new_bytes = 500 * GB
+    cost = calculate_tiered_cost(new_bytes, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=cumulative_before)
+    # 240 GB in tier 1 @ $0.09 + 260 GB in tier 2 @ $0.085
+    expected = (240 * 0.09) + (260 * 0.085)  # $21.60 + $22.10 = $43.70
+    passed = abs(cost - expected) < 0.01
+    print(f"    240 GB @ $0.09 + 260 GB @ $0.085 = ${expected:.2f}")
+    print(f"    Expected: ${expected:.2f}, Got: ${cost:.2f} {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    # Test 3: Already in tier 2 (20,000 GB), transfer 100 GB (stays in tier 2)
+    print("\n  Test 3: 20,000 GB cumulative (tier 2), transfer 100 GB (stays in tier 2)")
+    cumulative_before = 20000 * GB
+    new_bytes = 100 * GB
+    cost = calculate_tiered_cost(new_bytes, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=cumulative_before)
+    expected = 100 * 0.085  # $8.50
+    passed = abs(cost - expected) < 0.01
+    print(f"    Expected: ${expected:.2f}, Got: ${cost:.2f} {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    # Test 4: At tier 2/3 boundary (51,000 GB), transfer 500 GB (crosses into tier 3)
+    print("\n  Test 4: 51,000 GB cumulative, transfer 500 GB (crosses tier 2->3)")
+    cumulative_before = 51000 * GB
+    new_bytes = 500 * GB
+    cost = calculate_tiered_cost(new_bytes, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=cumulative_before)
+    # 200 GB in tier 2 @ $0.085 + 300 GB in tier 3 @ $0.07
+    expected = (200 * 0.085) + (300 * 0.07)  # $17.00 + $21.00 = $38.00
+    passed = abs(cost - expected) < 0.01
+    print(f"    200 GB @ $0.085 + 300 GB @ $0.07 = ${expected:.2f}")
+    print(f"    Expected: ${expected:.2f}, Got: ${cost:.2f} {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    # Test 5: Already in tier 4 (200,000 GB), transfer 1000 GB
+    print("\n  Test 5: 200,000 GB cumulative (tier 4), transfer 1000 GB")
+    cumulative_before = 200000 * GB
+    new_bytes = 1000 * GB
+    cost = calculate_tiered_cost(new_bytes, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=cumulative_before)
+    expected = 1000 * 0.05  # $50.00
+    passed = abs(cost - expected) < 0.01
+    print(f"    Expected: ${expected:.2f}, Got: ${cost:.2f} {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    # Test 6: Verify cumulative tracking produces same total as single calculation
+    print("\n  Test 6: Verify cumulative tracking matches single calculation")
+    # Calculate 15 TB in one go
+    single_cost = calculate_tiered_cost(15000 * GB, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=0)
+    # Calculate same amount in 3 chunks: 5TB + 5TB + 5TB
+    chunk1 = calculate_tiered_cost(5000 * GB, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=0)
+    chunk2 = calculate_tiered_cost(5000 * GB, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=5000 * GB)
+    chunk3 = calculate_tiered_cost(5000 * GB, DEFAULT_EGRESS_TIERS, cumulative_bytes_before=10000 * GB)
+    cumulative_cost = chunk1 + chunk2 + chunk3
+    passed = abs(single_cost - cumulative_cost) < 0.01
+    print(f"    Single 15TB calculation: ${single_cost:.2f}")
+    print(f"    3x 5TB chunks: ${chunk1:.2f} + ${chunk2:.2f} + ${chunk3:.2f} = ${cumulative_cost:.2f}")
+    print(f"    Match: {'✓' if passed else '✗'}")
+    all_passed = all_passed and passed
+
+    return all_passed
 
 
 def main():
@@ -159,6 +242,7 @@ def main():
         ("NAT Gateway Rate", test_nat_gateway_rate),
         ("Complete Rate Fetch", test_fetch_dynamic_rates),
         ("Tiered Cost Calculation", test_tiered_cost_calculation),
+        ("Cumulative Tiered Pricing", test_cumulative_tiered_pricing),
     ]
 
     results = []
