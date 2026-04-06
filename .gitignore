@@ -2,6 +2,10 @@
 PLAN.md
 PRD-*.md
 
+# Claude Code instructions and feedback docs
+CLAUDE.md
+*.pdf
+
 # Python
 __pycache__/
 *.py[cod]

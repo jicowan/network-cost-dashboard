@@ -17,6 +17,7 @@ DROP TABLE IF EXISTS network_costs.network_cost_summary;
 CREATE EXTERNAL TABLE network_costs.network_cost_details (
     period_start          STRING,
     destination_category  STRING,
+    direction             STRING COMMENT 'egress (external) or internal (cluster)',
     local_ip              STRING,
     local_az              STRING,
     local_vpc_id          STRING,

@@ -27,6 +27,38 @@ athena = boto3.client("athena", region_name=AWS_REGION)
 # Athena query helpers
 # -------------------------------------------------------------------
 
+@st.cache_data(ttl=3600)
+def check_column_exists(table_name: str, column_name: str) -> bool:
+    """Check if a column exists in an Athena table (cached for 1 hour)."""
+    try:
+        resp = athena.start_query_execution(
+            QueryString=f"SHOW COLUMNS IN {table_name}",
+            QueryExecutionContext={"Database": ATHENA_DATABASE},
+            ResultConfiguration={"OutputLocation": ATHENA_OUTPUT},
+        )
+        query_id = resp["QueryExecutionId"]
+
+        for _ in range(30):
+            status = athena.get_query_execution(QueryExecutionId=query_id)
+            state = status["QueryExecution"]["Status"]["State"]
+            if state == "SUCCEEDED":
+                break
+            if state in ("FAILED", "CANCELLED"):
+                return False
+            time.sleep(0.5)
+        else:
+            return False
+
+        paginator = athena.get_paginator("get_query_results")
+        for page in paginator.paginate(QueryExecutionId=query_id):
+            for row in page["ResultSet"]["Rows"]:
+                if row["Data"] and row["Data"][0].get("VarCharValue") == column_name:
+                    return True
+        return False
+    except Exception:
+        return False
+
+
 def run_query(sql):
     """Execute an Athena query and return a DataFrame."""
     resp = athena.start_query_execution(
@@ -186,6 +218,10 @@ with tab_overview:
 
 with tab_namespaces:
     st.subheader("Cost by Namespace")
+    st.caption(
+        "Namespaces starting with `node:` represent traffic from pods using "
+        "host networking or node-level processes where K8s metadata is unavailable."
+    )
 
     df_ns = run_query(f"""
         SELECT
@@ -251,6 +287,9 @@ with tab_namespaces:
 with tab_flows:
     st.subheader("Top Cross-AZ Flows")
 
+    # Check if direction column exists (new schema)
+    has_direction_col = check_column_exists("network_cost_details", "direction")
+
     col_cat, col_limit = st.columns(2)
 
     with col_cat:
@@ -269,7 +308,10 @@ with tab_flows:
     with col_limit:
         limit = st.slider("Number of flows", min_value=10, max_value=100, value=25)
 
-    col_pod_only, col_group_by = st.columns(2)
+    if has_direction_col:
+        col_pod_only, col_group_by, col_direction = st.columns(3)
+    else:
+        col_pod_only, col_group_by = st.columns(2)
 
     with col_pod_only:
         pod_only = st.checkbox(
@@ -286,6 +328,16 @@ with tab_flows:
             help="Choose how to aggregate flow data",
         )
 
+    direction_filter = "All"
+    if has_direction_col:
+        with col_direction:
+            direction_filter = st.selectbox(
+                "Direction",
+                options=["All", "Egress only", "Internal only"],
+                index=0,
+                help="egress = external (S3, internet), internal = within cluster",
+            )
+
     # Build WHERE clause
     where_clauses = [
         f"destination_category = '{category_filter}'",
@@ -293,12 +345,21 @@ with tab_flows:
     ]
     if pod_only:
         where_clauses.append("local_pod_namespace != ''")
+    if has_direction_col and direction_filter == "Egress only":
+        where_clauses.append("direction = 'egress'")
+    elif has_direction_col and direction_filter == "Internal only":
+        where_clauses.append("direction = 'internal'")
 
     where_sql = " AND ".join(where_clauses)
+
+    # Build SELECT/GROUP BY columns (direction is optional for backward compatibility)
+    dir_select = "direction," if has_direction_col else ""
+    dir_group = "direction," if has_direction_col else ""
 
     if group_by == "Service":
         df_flows = run_query(f"""
             SELECT
+                {dir_select}
                 local_pod_namespace,
                 local_service_name,
                 local_az,
@@ -310,13 +371,15 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            GROUP BY {dir_group} local_pod_namespace, local_service_name, local_az,
+                     remote_pod_namespace, remote_service_name, remote_az, target_port
             ORDER BY cost DESC
             LIMIT {limit}
         """)
     elif group_by == "Deployment":
         df_flows = run_query(f"""
             SELECT
+                {dir_select}
                 local_pod_namespace,
                 regexp_extract(local_pod_name, '^(.*)-[a-z0-9]+-[a-z0-9]+$', 1) AS local_deployment,
                 local_az,
@@ -328,13 +391,15 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            GROUP BY {dir_group} local_pod_namespace, local_deployment, local_az,
+                     remote_pod_namespace, remote_deployment, remote_az, target_port
             ORDER BY cost DESC
             LIMIT {limit}
         """)
     elif group_by == "ReplicaSet":
         df_flows = run_query(f"""
             SELECT
+                {dir_select}
                 local_pod_namespace,
                 regexp_extract(local_pod_name, '^(.*)-[a-z0-9]+$', 1) AS local_replicaset,
                 local_az,
@@ -346,7 +411,8 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY 1, 2, 3, 4, 5, 6, 7
+            GROUP BY {dir_group} local_pod_namespace, local_replicaset, local_az,
+                     remote_pod_namespace, remote_replicaset, remote_az, target_port
             ORDER BY cost DESC
             LIMIT {limit}
         """)
@@ -354,6 +420,7 @@ with tab_flows:
         # Pod IP - show individual pod IPs
         df_flows = run_query(f"""
             SELECT
+                {dir_select}
                 local_pod_namespace,
                 local_pod_name,
                 local_az,
@@ -366,7 +433,8 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
+            GROUP BY {dir_group} local_pod_namespace, local_pod_name, local_az,
+                     remote_pod_namespace, remote_pod_name, remote_az, remote_ip, target_port
             ORDER BY cost DESC
             LIMIT {limit}
         """)

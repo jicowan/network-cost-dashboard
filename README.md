@@ -120,6 +120,7 @@ CREATE DATABASE IF NOT EXISTS network_costs;
 CREATE EXTERNAL TABLE network_costs.network_cost_details (
   period_start          STRING,
   destination_category  STRING,
+  direction             STRING,
   local_ip              STRING,
   local_az              STRING,
   local_vpc_id          STRING,

@@ -55,6 +55,16 @@ COST_CATEGORIES = [
     "UNCLASSIFIED",
 ]
 
+# Categories where agents may exist on both endpoints, causing duplicate flow reports
+# External services (S3, DynamoDB, internet) don't have agents, so no duplication
+CATEGORIES_NEEDING_DEDUP = {"INTER_AZ", "INTER_VPC", "INTER_REGION"}
+
+# Traffic direction classification
+# External categories have no agent on remote — definitively egress from cluster
+# Internal categories are bidirectional — can't reliably determine initiator
+EGRESS_CATEGORIES = {"UNCLASSIFIED", "AMAZON_S3", "AMAZON_DYNAMODB"}
+INTERNAL_CATEGORIES = {"INTER_AZ", "INTER_VPC", "INTER_REGION", "INTRA_AZ"}
+
 # Map AWS region codes to location names used in Pricing API
 REGION_TO_LOCATION = {
     "us-east-1": "US East (N. Virginia)",
@@ -113,6 +123,7 @@ CUMULATIVE_PREFIX = "cumulative"
 DETAILS_SCHEMA = pa.schema([
     ('period_start', pa.string()),
     ('destination_category', pa.string()),
+    ('direction', pa.string()),  # 'egress' (external) or 'internal' (cluster)
     ('local_ip', pa.string()),
     ('local_az', pa.string()),
     ('local_vpc_id', pa.string()),
@@ -462,6 +473,82 @@ def calculate_tiered_cost(
     return total_cost
 
 
+def deduplicate_flows(contributors: list[dict]) -> list[dict]:
+    """
+    Deduplicate mirrored flows that occur when NFM agents run on both endpoints.
+
+    When agents are installed on both ends of a connection (common in EKS),
+    the same flow is reported twice with local/remote IPs swapped but identical
+    byte counts. This function correlates these by creating a canonical key
+    using sorted IP pairs.
+
+    Only deduplicates categories where both endpoints may have agents:
+    INTER_AZ, INTER_VPC, INTER_REGION. External traffic (UNCLASSIFIED,
+    AMAZON_S3, AMAZON_DYNAMODB) is not duplicated since external endpoints
+    don't have NFM agents.
+
+    Args:
+        contributors: List of flattened contributor dicts from query_top_contributors
+
+    Returns:
+        Deduplicated list of contributors
+    """
+    # Separate flows that need deduplication from those that don't
+    needs_dedup = []
+    no_dedup = []
+
+    for flow in contributors:
+        if flow["destination_category"] in CATEGORIES_NEEDING_DEDUP:
+            needs_dedup.append(flow)
+        else:
+            no_dedup.append(flow)
+
+    if not needs_dedup:
+        return contributors
+
+    # Group flows by canonical key (sorted IP pair ensures mirrored flows match)
+    flow_groups = defaultdict(list)
+    for flow in needs_dedup:
+        # Sort IPs so (A->B) and (B->A) produce the same key
+        ip_pair = tuple(sorted([flow["local_ip"], flow["remote_ip"]]))
+        key = (
+            flow["period_start"],
+            flow["destination_category"],
+            ip_pair,
+            flow["target_port"],
+        )
+        flow_groups[key].append(flow)
+
+    # Take one representative flow per group
+    # Mirrored flows have identical bytes, so we just pick the first
+    # But prefer the one with more K8s metadata if available
+    deduplicated = []
+    duplicate_count = 0
+
+    for key, flows in flow_groups.items():
+        if len(flows) > 1:
+            duplicate_count += len(flows) - 1
+            # Prefer flow with local K8s metadata (the "source" perspective)
+            flows_with_metadata = [
+                f for f in flows if f.get("local_pod_namespace")
+            ]
+            if flows_with_metadata:
+                deduplicated.append(flows_with_metadata[0])
+            else:
+                deduplicated.append(flows[0])
+        else:
+            deduplicated.append(flows[0])
+
+    if duplicate_count > 0:
+        logger.info(
+            "Deduplicated %d mirrored flows (kept %d unique flows)",
+            duplicate_count,
+            len(deduplicated),
+        )
+
+    return deduplicated + no_dedup
+
+
 def handler(event, context):
     """
     Triggered by EventBridge on a schedule (e.g. hourly).
@@ -500,6 +587,17 @@ def handler(event, context):
             category,
             len(contributors),
             sum(c["bytes"] for c in contributors) / (1024**3),
+        )
+
+    # Deduplicate mirrored flows from agents on both endpoints
+    # This prevents double-counting for INTER_AZ, INTER_VPC, INTER_REGION
+    pre_dedup_count = len(all_contributors)
+    all_contributors = deduplicate_flows(all_contributors)
+    if pre_dedup_count != len(all_contributors):
+        logger.info(
+            "Flow count after deduplication: %d (was %d)",
+            len(all_contributors),
+            pre_dedup_count,
         )
 
     # Recalculate UNCLASSIFIED costs using tiered pricing based on monthly cumulative volume
@@ -643,6 +741,25 @@ def query_top_contributors(start_time, end_time, category, rates):
     return contributors
 
 
+def get_traffic_direction(category: str) -> str:
+    """
+    Determine traffic direction based on destination category.
+
+    External traffic (UNCLASSIFIED, S3, DynamoDB) is definitively egress
+    because there's no NFM agent on the remote endpoint — we only see
+    flows from the cluster's perspective.
+
+    Internal traffic (INTER_AZ, INTER_VPC, INTER_REGION) is bidirectional
+    and we can't reliably determine the connection initiator.
+
+    Returns:
+        'egress' for external traffic, 'internal' for cluster traffic
+    """
+    if category in EGRESS_CATEGORIES:
+        return "egress"
+    return "internal"
+
+
 def flatten_contributor(contributor, category, period_start, rates):
     """Flatten a top-contributor record into a simple dict for storage."""
     k8s = contributor.get("kubernetesMetadata", {})
@@ -654,6 +771,7 @@ def flatten_contributor(contributor, category, period_start, rates):
     return {
         "period_start": period_start.isoformat(),
         "destination_category": category,
+        "direction": get_traffic_direction(category),
         # Local (source) info
         "local_ip": contributor.get("localIp", ""),
         "local_az": contributor.get("localAz", ""),
@@ -696,12 +814,38 @@ def flatten_contributor(contributor, category, period_start, rates):
     }
 
 
+def get_namespace_attribution(contributor: dict) -> str:
+    """
+    Determine namespace attribution for a flow, with fallbacks.
+
+    K8s metadata may be missing for:
+    - Host-network pods (hostNetwork: true)
+    - Node-level traffic (kubelet, kube-proxy, CNI)
+    - Traffic from non-EKS sources on shared nodes
+
+    Fallback hierarchy:
+    1. local_pod_namespace (preferred - actual K8s namespace)
+    2. "node:<instance_id>" (node-level traffic attribution)
+    3. "(unattributed)" (no identifying information)
+    """
+    if contributor.get("local_pod_namespace"):
+        return contributor["local_pod_namespace"]
+
+    # No K8s metadata - fall back to instance-level attribution
+    # This is common for UNCLASSIFIED traffic and host-network pods
+    instance_id = contributor.get("local_instance_id")
+    if instance_id:
+        return f"node:{instance_id}"
+
+    return "(unattributed)"
+
+
 def build_namespace_summary(contributors):
     """Aggregate contributors into a namespace-level cost summary."""
     agg = defaultdict(lambda: defaultdict(float))
 
     for c in contributors:
-        ns = c["local_pod_namespace"] or "(non-pod)"
+        ns = get_namespace_attribution(c)
         cat = c["destination_category"]
         key = (ns, cat)
         agg[key]["bytes"] += c["bytes"]
