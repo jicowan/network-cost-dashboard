@@ -317,6 +317,13 @@ Based on the data collected, consider these optimizations:
 3. **VPC endpoints**: Add gateway endpoints for S3/DynamoDB to eliminate NAT costs
 4. **Review UNCLASSIFIED traffic**: Internet egress is expensive; consider caching or CDN
 
+## Future Enhancements
+
+- **Coverage validation**: Compare Network Flow Monitor bytes against CUR data to quantify the long-tail gap from the top-500 limit
+- **QuickSight dashboard**: Connect Athena to QuickSight for visual cost reports
+- **Alerting**: CloudWatch alarms when a namespace's hourly cost exceeds a threshold
+- **Multi-cluster support**: Aggregate data from multiple EKS clusters
+
 ## License
 
 MIT

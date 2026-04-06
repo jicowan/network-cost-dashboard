@@ -27,7 +27,7 @@ athena = boto3.client("athena", region_name=AWS_REGION)
 # Athena query helpers
 # -------------------------------------------------------------------
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=60)  # Short TTL to pick up schema changes quickly
 def check_column_exists(table_name: str, column_name: str) -> bool:
     """Check if a column exists in an Athena table (cached for 1 hour)."""
     try:
@@ -377,6 +377,7 @@ with tab_flows:
             LIMIT {limit}
         """)
     elif group_by == "Deployment":
+        # Use positional GROUP BY since Athena doesn't allow aliases in GROUP BY
         df_flows = run_query(f"""
             SELECT
                 {dir_select}
@@ -391,12 +392,12 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY {dir_group} local_pod_namespace, local_deployment, local_az,
-                     remote_pod_namespace, remote_deployment, remote_az, target_port
+            GROUP BY {dir_group} {2 if has_direction_col else 1}, {3 if has_direction_col else 2}, {4 if has_direction_col else 3}, {5 if has_direction_col else 4}, {6 if has_direction_col else 5}, {7 if has_direction_col else 6}, {8 if has_direction_col else 7}
             ORDER BY cost DESC
             LIMIT {limit}
         """)
     elif group_by == "ReplicaSet":
+        # Use positional GROUP BY since Athena doesn't allow aliases in GROUP BY
         df_flows = run_query(f"""
             SELECT
                 {dir_select}
@@ -411,8 +412,7 @@ with tab_flows:
                 SUM(estimated_cost_usd) AS cost
             FROM network_cost_details
             WHERE {where_sql}
-            GROUP BY {dir_group} local_pod_namespace, local_replicaset, local_az,
-                     remote_pod_namespace, remote_replicaset, remote_az, target_port
+            GROUP BY {dir_group} {2 if has_direction_col else 1}, {3 if has_direction_col else 2}, {4 if has_direction_col else 3}, {5 if has_direction_col else 4}, {6 if has_direction_col else 5}, {7 if has_direction_col else 6}, {8 if has_direction_col else 7}
             ORDER BY cost DESC
             LIMIT {limit}
         """)

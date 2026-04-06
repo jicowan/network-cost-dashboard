@@ -1,0 +1,29 @@
+# Example Terraform variables for EKS Network Cost Monitor
+# Copy this file to terraform.tfvars and update the values
+
+# Required
+region           = "us-west-2"
+monitor_name     = "my-eks-cluster-flow-monitor"
+eks_cluster_name = "my-eks-cluster"
+
+# Optional - uncomment and modify as needed
+# s3_bucket_name        = "my-custom-bucket-name"
+# athena_database       = "network_costs"
+# lambda_function_name  = "eks-network-cost-exporter"
+# data_retention_days   = 90
+
+# VPC Gateway Endpoints
+# Set to true if you already have gateway endpoints
+# has_s3_endpoint       = false
+# has_dynamodb_endpoint = false
+
+# Or create new gateway endpoints (requires vpc_id and route_table_ids)
+# create_vpc_endpoints  = true
+# vpc_id                = "vpc-12345678"
+# route_table_ids       = ["rtb-12345678", "rtb-87654321"]
+
+# Tags
+# tags = {
+#   Environment = "production"
+#   Team        = "platform"
+# }
