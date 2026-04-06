@@ -52,8 +52,11 @@ def check_column_exists(table_name: str, column_name: str) -> bool:
         paginator = athena.get_paginator("get_query_results")
         for page in paginator.paginate(QueryExecutionId=query_id):
             for row in page["ResultSet"]["Rows"]:
-                if row["Data"] and row["Data"][0].get("VarCharValue") == column_name:
-                    return True
+                if row["Data"]:
+                    # Strip whitespace - Athena SHOW COLUMNS pads column names
+                    col = row["Data"][0].get("VarCharValue", "").strip()
+                    if col == column_name:
+                        return True
         return False
     except Exception:
         return False
@@ -285,12 +288,13 @@ with tab_namespaces:
 # -------------------------------------------------------------------
 
 with tab_flows:
-    st.subheader("Top Cross-AZ Flows")
+    st.subheader("Top Flows")
 
     # Check if direction column exists (new schema)
     has_direction_col = check_column_exists("network_cost_details", "direction")
 
-    col_cat, col_limit = st.columns(2)
+    # Row 1: Traffic category, Group by, Direction
+    col_cat, col_group, col_dir = st.columns(3)
 
     with col_cat:
         category_filter = st.selectbox(
@@ -305,22 +309,7 @@ with tab_flows:
             ],
         )
 
-    with col_limit:
-        limit = st.slider("Number of flows", min_value=10, max_value=100, value=25)
-
-    if has_direction_col:
-        col_pod_only, col_group_by, col_direction = st.columns(3)
-    else:
-        col_pod_only, col_group_by = st.columns(2)
-
-    with col_pod_only:
-        pod_only = st.checkbox(
-            "Show pod-to-pod flows only",
-            value=True,
-            help="Exclude node-level traffic (kubelet, kube-proxy, etc.)",
-        )
-
-    with col_group_by:
+    with col_group:
         group_by = st.selectbox(
             "Group by",
             options=["Service", "Deployment", "ReplicaSet", "Pod IP"],
@@ -329,14 +318,42 @@ with tab_flows:
         )
 
     direction_filter = "All"
-    if has_direction_col:
-        with col_direction:
+    with col_dir:
+        if has_direction_col:
             direction_filter = st.selectbox(
                 "Direction",
                 options=["All", "Egress only", "Internal only"],
                 index=0,
                 help="egress = external (S3, internet), internal = within cluster",
             )
+        else:
+            st.selectbox(
+                "Direction",
+                options=["All"],
+                index=0,
+                disabled=True,
+                help="Direction data not available (run Lambda to populate)",
+            )
+
+    # Row 2: Checkboxes
+    col_pod_only, col_hide_port0 = st.columns(2)
+
+    with col_pod_only:
+        pod_only = st.checkbox(
+            "Pod-to-pod flows only",
+            value=True,
+            help="Exclude node-level traffic (kubelet, kube-proxy, etc.)",
+        )
+
+    with col_hide_port0:
+        hide_port_zero = st.checkbox(
+            "Hide port-0 flows",
+            value=False,
+            help="Port 0 is an aggregation placeholder used by NFM when multiple ports are involved",
+        )
+
+    # Row 3: Slider
+    limit = st.slider("Number of flows", min_value=10, max_value=100, value=25)
 
     # Build WHERE clause
     where_clauses = [
@@ -345,6 +362,8 @@ with tab_flows:
     ]
     if pod_only:
         where_clauses.append("local_pod_namespace != ''")
+    if hide_port_zero:
+        where_clauses.append("target_port != 0")
     if has_direction_col and direction_filter == "Egress only":
         where_clauses.append("direction = 'egress'")
     elif has_direction_col and direction_filter == "Internal only":
